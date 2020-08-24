@@ -105,10 +105,12 @@ export type Experimental_DidResolveQueryPlanCallback = ({
   queryPlan,
   serviceMap,
   operationContext,
+  requestContext,
 }: {
   readonly queryPlan: QueryPlan;
   readonly serviceMap: ServiceMap;
   readonly operationContext: OperationContext;
+  readonly requestContext: GraphQLRequestContextExecutionDidStart<Record<string, any>>;
 }) => void;
 
 export type Experimental_DidFailCompositionCallback = ({
@@ -298,7 +300,20 @@ export class ApolloGateway implements GraphQLService {
   }
 
   public async load(options?: { engine?: GraphQLServiceEngineConfig }) {
-    await this.updateComposition(options);
+    if (options && options.engine) {
+      if (!options.engine.graphVariant)
+        this.logger.warn('No graph variant provided. Defaulting to `current`.');
+      this.engineConfig = options.engine;
+    }
+
+    await this.updateComposition();
+    if (
+      (isManagedConfig(this.config) || this.experimental_pollInterval) &&
+      !this.pollingTimer
+    ) {
+      this.pollServices();
+    }
+
     const { graphId, graphVariant } = (options && options.engine) || {};
     const mode = isManagedConfig(this.config) ? 'managed' : 'unmanaged';
 
@@ -316,17 +331,7 @@ export class ApolloGateway implements GraphQLService {
     };
   }
 
-  protected async updateComposition(options?: {
-    engine?: GraphQLServiceEngineConfig;
-  }): Promise<void> {
-    // The options argument and internal config update could be handled by this.load()
-    // instead of here. We can remove this as a breaking change in the future.
-    if (options && options.engine) {
-      if (!options.engine.graphVariant)
-        this.logger.warn('No graph variant provided. Defaulting to `current`.');
-      this.engineConfig = options.engine;
-    }
-
+  protected async updateComposition(): Promise<void> {
     let result: Await<ReturnType<Experimental_UpdateServiceDefinitions>>;
     this.logger.debug('Checking service definitions...');
     try {
@@ -471,6 +476,10 @@ export class ApolloGateway implements GraphQLService {
 
     this.logger.debug('Schema loaded and ready for execution');
 
+    // FIXME: The comment below may change when `graphql-extensions` is
+    // removed, as it will be soon.  It's not clear if this will be temporary,
+    // as is suggested, after that time, because we still very much need to
+    // do this special alias resolving.  Original comment:
     // this is a temporary workaround for GraphQLFieldExtensions automatic
     // wrapping of all fields when using ApolloServer. Here we wrap all fields
     // with support for resolving aliases as part of the root value which
@@ -480,35 +489,20 @@ export class ApolloGateway implements GraphQLService {
   }
 
   public onSchemaChange(callback: SchemaChangeCallback): Unsubscriber {
-    if (!isManagedConfig(this.config) && !this.experimental_pollInterval) {
-      return () => {};
-    }
-
     this.onSchemaChangeListeners.add(callback);
-    if (!this.pollingTimer) this.pollServices();
 
     return () => {
       this.onSchemaChangeListeners.delete(callback);
-      if (this.onSchemaChangeListeners.size === 0 && this.pollingTimer) {
-        clearInterval(this.pollingTimer!);
-        this.pollingTimer = undefined;
-      }
     };
   }
 
   private async pollServices() {
     if (this.pollingTimer) clearTimeout(this.pollingTimer);
 
-    try {
-      await this.updateComposition();
-    } catch (err) {
-      this.logger.error(err && err.message || err);
-    }
-
     // Sleep for the specified pollInterval before kicking off another round of polling
     await new Promise(res => {
       this.pollingTimer = setTimeout(
-        res,
+        () => res(),
         this.experimental_pollInterval || 10000,
       );
       // Prevent the Node.js event loop from remaining active (and preventing,
@@ -516,6 +510,12 @@ export class ApolloGateway implements GraphQLService {
       // information, see https://nodejs.org/api/timers.html#timers_timeout_unref.
       this.pollingTimer?.unref();
     });
+
+    try {
+      await this.updateComposition();
+    } catch (err) {
+      this.logger.error(err && err.message || err);
+    }
 
     this.pollServices();
   }
@@ -567,7 +567,7 @@ export class ApolloGateway implements GraphQLService {
     // is invoked below. It is a helper, rather than an options object, since it
     // depends on the presence of `this.engineConfig`, which is guarded against
     // further down in this method in two separate places.
-    const getRemoteConfig = (engineConfig: GraphQLServiceEngineConfig) => {
+    const getManagedConfig = (engineConfig: GraphQLServiceEngineConfig) => {
       return getServiceDefinitionsFromStorage({
         graphId: engineConfig.graphId,
         apiKeyHash: engineConfig.apiKeyHash,
@@ -585,7 +585,7 @@ export class ApolloGateway implements GraphQLService {
         // This error helps avoid common misconfiguration.
         // We don't await this because a local configuration should assume
         // remote is unavailable for one reason or another.
-        getRemoteConfig(this.engineConfig).then(() => {
+        getManagedConfig(this.engineConfig).then(() => {
           this.logger.warn(
             "A local gateway service list is overriding an Apollo Graph " +
             "Manager managed configuration.  To use the managed " +
@@ -620,7 +620,7 @@ export class ApolloGateway implements GraphQLService {
       );
     }
 
-    return getRemoteConfig(this.engineConfig);
+    return getManagedConfig(this.engineConfig);
   }
 
   // XXX Nothing guarantees that the only errors thrown or returned in
@@ -696,6 +696,7 @@ export class ApolloGateway implements GraphQLService {
       this.experimental_didResolveQueryPlan({
         queryPlan,
         serviceMap,
+        requestContext,
         operationContext,
       });
     }
