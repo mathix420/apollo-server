@@ -45,11 +45,13 @@ export function graphqlLambda(
       });
     }
 
-    const contentType = event.headers["content-type"] || event.headers["Content-Type"];
+    const contentType = (
+      event.headers['content-type'] || event.headers['Content-Type'] || ''
+    ).toLowerCase();
     let query: Record<string, any> | Record<string, any>[];
 
     if (body && event.httpMethod === 'POST' &&
-      contentType && contentType.startsWith("multipart/form-data")
+      contentType.startsWith('multipart/form-data')
     ) {
       query = body as any;
     } else if (body && event.httpMethod === 'POST') {
